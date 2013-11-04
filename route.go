@@ -117,6 +117,10 @@ type Packet struct {
 	data []byte
 }
 
+func (p Packet) String() string {
+	return fmt.Sprintf("%v:%d -> %v:%d %d bytes", p.ip.SrcIP, p.tcp.SrcPort, p.ip.DstIP, p.tcp.DstPort, len(p.data))
+}
+
 func WritePkt(w io.Writer, pkt []byte) (err error) {
 	if w == nil {
 		return
@@ -223,12 +227,12 @@ func (t TunnelClient) Run() {
 		if myip.Equal(p.ip.DstIP) {
 			return
 		}
-		log.Println("socket >", p.ip.DstIP, len(p.data), "bytes")
+		log.Println(">>>", p)
 		WritePkt(conn, p.data)
 	}
 
 	doIn := func (p Packet) {
-		log.Println("socket <", p.ip.SrcIP, len(p.data), "bytes")
+		log.Println("<<<", p)
 		live.WritePacketData(p.data)
 	}
 
@@ -287,6 +291,8 @@ func (t *Nat) Out(p Packet) (b []byte) {
 		return
 	}
 
+	log.Println("wire <<<", p)
+
 	p.eth.SrcMAC = c.DstMAC
 	p.eth.DstMAC = c.SrcMAC
 
@@ -301,7 +307,8 @@ func (t *Nat) Out(p Packet) (b []byte) {
 	}
 
 	UpdatePkt(&p)
-	log.Println("socket <", p.ip.SrcIP, len(p.data), "bytes")
+
+	log.Println("socket >>>", p)
 
 	return p.data
 }
@@ -323,13 +330,15 @@ func (t *Nat) In(p Packet) (b []byte) {
 		t.table[h] = c
 	}
 
+	log.Println("socket <<<", p)
+
 	p.ip.SrcIP = myip
 	p.eth.SrcMAC = mymac
 	p.eth.DstMAC = gwmac
 	p.tcp.SrcPort = h
 
 	UpdatePkt(&p)
-	log.Println("socket >", p.ip.DstIP, len(p.data), "bytes", "syn", p.tcp.SYN)
+	log.Println("wire >>>", p)
 
 	return p.data
 }
