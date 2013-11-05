@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 	"io"
-	_ "io/ioutil"
+	"io/ioutil"
 	"bufio"
 	"strings"
 	"fmt"
@@ -114,11 +114,16 @@ type Packet struct {
 	eth *layers.Ethernet
 	ip *layers.IPv4
 	tcp *layers.TCP
+	udp *layers.UDP
+	app []byte
 	data []byte
 }
 
 func (p Packet) String() string {
-	return fmt.Sprintf("%v:%d -> %v:%d %d bytes", p.ip.SrcIP, p.tcp.SrcPort, p.ip.DstIP, p.tcp.DstPort, len(p.data))
+	if p.tcp != nil {
+		return fmt.Sprintf("TCP %v:%d -> %v:%d %d bytes", p.ip.SrcIP, p.tcp.SrcPort, p.ip.DstIP, p.tcp.DstPort, len(p.data))
+	}
+	return fmt.Sprintf("UDP %v:%d -> %v:%d %d bytes", p.ip.SrcIP, p.udp.SrcPort, p.ip.DstIP, p.udp.DstPort, len(p.data))
 }
 
 func WritePkt(w io.Writer, pkt []byte) (err error) {
@@ -137,8 +142,17 @@ func UpdatePkt(p *Packet) {
 		ComputeChecksums: true,
 		FixLengths: true,
 	}
-	p.tcp.SetNetworkLayerForChecksum(p.ip)
-	p.tcp.SerializeTo(buf, opts)
+	if len(p.app) > 0 {
+		appbuf, _ := buf.PrependBytes(len(p.app))
+		copy(appbuf, p.app)
+	}
+	if p.tcp != nil {
+		p.tcp.SetNetworkLayerForChecksum(p.ip)
+		p.tcp.SerializeTo(buf, opts)
+	} else {
+		p.udp.SetNetworkLayerForChecksum(p.ip)
+		p.udp.SerializeTo(buf, opts)
+	}
 	p.ip.SerializeTo(buf, opts)
 	p.eth.SerializeTo(buf, opts)
 	p.data = buf.Bytes()
@@ -148,25 +162,36 @@ func NewPkt(pbuf []byte) (p Packet, ok bool) {
 	pkt := gopacket.NewPacket(pbuf, layers.LinkTypeEthernet, gopacket.Default)
 	tcpLayer := pkt.Layer(layers.LayerTypeTCP)
 	p.tcp, _ = tcpLayer.(*layers.TCP)
+	udpLayer := pkt.Layer(layers.LayerTypeUDP)
+	p.udp, _ = udpLayer.(*layers.UDP)
 	ipLayer := pkt.Layer(layers.LayerTypeIPv4)
 	p.ip, _ = ipLayer.(*layers.IPv4)
 	ethLayer := pkt.Layer(layers.LayerTypeEthernet)
 	p.eth, _ = ethLayer.(*layers.Ethernet)
-	if !(p.tcp == nil || p.ip == nil || p.eth == nil) {
+	if !((p.tcp == nil && p.udp == nil) || p.ip == nil || p.eth == nil) {
 		ok = true
+	}
+	if p.udp != nil && !doudp {
+		ok = false
+		return
+	}
+	if appLayer := pkt.ApplicationLayer(); appLayer != nil {
+		p.app = appLayer.Payload()
 	}
 	p.data = pkt.Data()
 	return
 }
 
+const MTU = 4096
+
 func ConnLoop(conn net.Conn, cb func (pkt Packet)) {
 	var l uint16
-	var buf [1600]byte
+	var buf [MTU]byte
 	for {
 		if err := binary.Read(conn, binary.BigEndian, &l); err != nil{
 			break
 		}
-		if l > 1600 {
+		if l > MTU {
 			break
 		}
 		pbuf := buf[:int(l)]
@@ -183,7 +208,7 @@ func ConnLoop(conn net.Conn, cb func (pkt Packet)) {
 
 func openLiveHandle() (handle *pcap.Handle) {
 	var err error
-	if handle, err = pcap.OpenLive(gwiface, 1600, true, 0); err != nil {
+	if handle, err = pcap.OpenLive(gwiface, MTU, true, 0); err != nil {
 		panic(err)
 	}
 	log.Println("Pcap", gwiface, "opened")
@@ -260,32 +285,37 @@ func (t TunnelClient) Run() {
 
 type natConn struct {
 	Ts time.Time
-	SrcPort layers.TCPPort
+	SrcPort uint16
 	SrcIP net.IP
 	SrcMAC, DstMAC net.HardwareAddr
 }
 
 type Nat struct {
-	table map[layers.TCPPort]*natConn
+	table map[uint16]*natConn
 }
 
 func NewNat() *Nat {
 	t := &Nat{}
-	t.table = map[layers.TCPPort]*natConn{}
+	t.table = map[uint16]*natConn{}
 	return t
 }
 
-func (t *Nat) Hash(ip *layers.IPv4, tcp *layers.TCP) (h uint16) {
+func (t *Nat) Hash(ip *layers.IPv4, srcPort uint16) (h uint16) {
 	h += 3*uint16(ip.SrcIP[0]) + 23*uint16(ip.SrcIP[1]) +
 			 13*uint16(ip.SrcIP[2]) + 31*uint16(ip.SrcIP[3])
 	h += 13*uint16(ip.DstIP[0]) + 31*uint16(ip.DstIP[1]) +
 			 3*uint16(ip.DstIP[2]) + 23*uint16(ip.DstIP[3])
-	h += 37*uint16(tcp.SrcPort)
+	h += 37*srcPort
 	return
 }
 
 func (t *Nat) Out(p Packet) (b []byte) {
-	k := p.tcp.DstPort
+	var k uint16
+	if p.tcp != nil {
+		k = uint16(p.tcp.DstPort)
+	} else {
+		k = uint16(p.udp.DstPort)
+	}
 	c, _ := t.table[k]
 	if c == nil {
 		return
@@ -297,16 +327,19 @@ func (t *Nat) Out(p Packet) (b []byte) {
 	p.eth.DstMAC = c.SrcMAC
 
 	p.ip.DstIP = c.SrcIP
-	p.tcp.DstPort = c.SrcPort
 
-	if p.tcp.FIN || p.tcp.RST {
-		log.Println("nat del", k)
-		delete(t.table, k)
+	if p.tcp != nil {
+		p.tcp.DstPort = layers.TCPPort(c.SrcPort)
+		if p.tcp.FIN || p.tcp.RST {
+			log.Println("nat del", k)
+			delete(t.table, k)
+		}
 	} else {
-		c.Ts = time.Now()
+		p.udp.DstPort = layers.UDPPort(c.SrcPort)
 	}
 
 	UpdatePkt(&p)
+	c.Ts = time.Now()
 
 	log.Println("socket >>>", p)
 
@@ -316,26 +349,39 @@ func (t *Nat) Out(p Packet) (b []byte) {
 func (t *Nat) In(p Packet) (b []byte) {
 	//ioutil.WriteFile("/tmp/b.pkt", pkt.Data(), 0777)
 
-	h := layers.TCPPort(t.Hash(p.ip, p.tcp))
-	c, _ := t.table[h]
-	if p.tcp.SYN && c == nil {
-		log.Println("nat new", h)
+	var k uint16
+	var srcPort uint16
+	if p.tcp != nil {
+		srcPort = uint16(p.tcp.SrcPort)
+	} else {
+		srcPort = uint16(p.udp.SrcPort)
+	}
+	k = t.Hash(p.ip, srcPort)
+
+	log.Println("socket <<<", p)
+
+	c, _ := t.table[k]
+	if ((p.tcp != nil && p.tcp.SYN) || p.udp != nil) && c == nil {
+		log.Println("nat new", k)
 		c = &natConn{
 			Ts: time.Now(),
-			SrcPort: p.tcp.SrcPort,
+			SrcPort: srcPort,
 			SrcIP: p.ip.SrcIP,
 			SrcMAC: p.eth.SrcMAC,
 			DstMAC: p.eth.DstMAC,
 		}
-		t.table[h] = c
+		t.table[k] = c
 	}
-
-	log.Println("socket <<<", p)
 
 	p.ip.SrcIP = myip
 	p.eth.SrcMAC = mymac
 	p.eth.DstMAC = gwmac
-	p.tcp.SrcPort = h
+
+	if p.tcp != nil {
+		p.tcp.SrcPort = layers.TCPPort(k)
+	} else {
+		p.udp.SrcPort = layers.UDPPort(k)
+	}
 
 	UpdatePkt(&p)
 	log.Println("wire >>>", p)
@@ -402,6 +448,7 @@ var (
 	gfilter string //"dst net 95.138.148.0 mask 255.255.255.0"
 	gport int
 	ghost string
+	doudp bool
 )
 
 func main() {
@@ -412,6 +459,7 @@ func main() {
 	flag.IntVar(&gport, "p", 9998, "tunnel server listen port")
 	flag.StringVar(&gfilter, "f", "", "tunnel pcap filter")
 	flag.BoolVar(&test, "t", false, "test")
+	flag.BoolVar(&doudp, "udp", false, "do udp nat")
 	flag.Parse()
 
 	gwiface, gwip, gwmac = findGateway()
@@ -421,6 +469,21 @@ func main() {
 	log.Println("Found my ip", myip, "mac", mymac)
 
 	if test {
+		b, _ := ioutil.ReadFile("e.pkt")
+		pkt := gopacket.NewPacket(b, layers.LayerTypeEthernet, gopacket.Default)
+		for layer := range pkt.Layers() {
+			log.Println("layer", layer)
+		}
+		app := pkt.ApplicationLayer()
+		log.Println("app", app)
+
+		mypkt, _ := NewPkt(b)
+		log.Printf("oldchecksum %x %x\n", mypkt.tcp.Checksum, ^mypkt.tcp.Checksum)
+		log.Println("applen", len(mypkt.app))
+		UpdatePkt(&mypkt)
+		log.Println("data", len(mypkt.data))
+
+		log.Printf("newchecksum %x\n", mypkt.tcp.Checksum)
 		return
 	}
 
